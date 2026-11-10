@@ -1,2 +1,11 @@
 result
 result-*
+
+# horas's data folder (HORAS_DIR, by default ~/.local/share/horas).
+# These hold the Google client, tokens and the calendar copy: never commit them.
+client.json
+google.json
+bearer
+copy.json
+*.tmp
+peers
