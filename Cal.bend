@@ -157,6 +157,25 @@ def Body.of(+j: J.Json) -> Body:
        When.of(J.Json.get(j, "start")), When.of(J.Json.get(j, "end")),
        J.Json.texts(J.Json.get(j, "recurrence"))}
 
+# Google's copy of an event. Google writes a time with its offset after it,
+# "2026-12-01T19:00:00-06:00", in the event's zone; horas keeps the time as
+# it is read on a clock there, and the zone. An event that names no zone is in
+# the calendar's.
+def zone.or(+z: String, +d: String) -> String:
+  Bool.pick(String, String.is_empty(z), d, z)
+
+def When.google(+j: J.Json, +zone: String) -> When:
+  Bool.pick(When, J.Json.has(j, "date"), Day{J.Json.at(j, "date")},
+  Bool.pick(When, J.Json.has(j, "dateTime"),
+    At{String.take(J.Json.at(j, "dateTime"), 19n), zone.or(J.Json.at(j, "timeZone"), zone)},
+    NoTime{}))
+
+def Body.google(+j: J.Json, +zone: String) -> Body:
+  Body{Bool.not(String.eq(J.Json.at(j, "status"), "cancelled")),
+       J.Json.at(j, "summary"), J.Json.at(j, "description"), J.Json.at(j, "location"),
+       When.google(J.Json.get(j, "start"), zone), When.google(J.Json.get(j, "end"), zone),
+       J.Json.texts(J.Json.get(j, "recurrence"))}
+
 def Body.canon(b: Body) -> String:
   J.Json.show(Body.json(b))
 

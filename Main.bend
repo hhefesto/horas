@@ -5,14 +5,17 @@ import ./Http.bend as H
 
 # horas: the command line. One copy of the calendar per machine, in
 # $HORAS_DIR/copy.json (default ~/.local/share/horas); `sync` joins it with
-# other machines' copies over ssh, so each ends with every edit either saw.
+# Google Calendar's copy and with other machines' copies over ssh, so each
+# ends with every edit either saw.
 #
 #   horas add TITLE WHEN [--end WHEN] [--at PLACE] [--notes TEXT]
 #   horas list
 #   horas show ID
 #   horas edit ID [--title T] [--start WHEN] [--end WHEN] [--at P] [--notes N]
 #   horas rm ID
-#   horas sync [PEER...]      (default: the lines of $HORAS_DIR/peers)
+#   horas sync [PEER...]      (a PEER is an ssh host, or google; by default
+#                             google once signed in, then the lines of
+#                             $HORAS_DIR/peers; exits 1 if one is missed)
 #   horas export              (the copy, as JSON: what a peer's sync reads)
 #   horas import FILE         (joins a copy written by export)
 #   horas login [ACCOUNT]     (signs this machine in to Google, once)
@@ -455,55 +458,55 @@ def ssh.args(+peer: String, cmd: String) -> List<String>:
 def push.cmd(+remote: String) -> String:
   "f=$(mktemp) && cat > \"$f\" && " ++ remote ++ " import \"$f\" > /dev/null; r=$?; rm -f \"$f\"; exit $r"
 
-def say.if(ok: Bool, +peer: String, +good: String, +err: String) -> IO(Unit):
+# A failure is said on stderr and answered False, so that sync goes on to
+# the other replicas and still exits non-zero.
+def failed(+what: String) -> IO(Bool):
+  do IO<Bool>:
+    IO.print_err(what)
+    return False{}
+
+def say.if(ok: Bool, +peer: String, +good: String, +err: String) -> IO(Bool):
   match ok:
     case True{}:
-      IO.print(peer ++ ": " ++ good)
+      do IO<Bool>:
+        IO.print(peer ++ ": " ++ good)
+        return True{}
     case False{}:
-      IO.print_err(peer ++ ": " ++ String.trim(err))
+      failed(peer ++ ": " ++ String.trim(err))
 
-def sync.pushed(+peer: String, +n: U32, r: Ran) -> IO(Unit):
+def sync.pushed(+peer: String, +n: U32, r: Ran) -> IO(Bool):
   match r:
     case Ran{+c, o, +e}:
       say.if(U32.is_eq(c, 0), peer, "in sync, " ++ U32.show(n) ++ " records", e)
 
-def sync.join(+e: Env, +peer: String, m: Maybe<&2, J.Json>) -> IO(Unit):
+def sync.join(+e: Env, +peer: String, m: Maybe<&2, J.Json>) -> IO(Bool):
   match m:
     case None{}:
-      IO.print_err(peer ++ ": its copy is not JSON; nothing was changed")
+      failed(peer ++ ": its copy is not JSON; nothing was changed")
     case Some{j}:
-      do IO<Unit>:
+      do IO<Bool>:
         +copy : List<&2, C.Rec> <- load(e)
         +both : List<&2, C.Rec> = C.join(copy, C.Copy.of.json(j))
         save(e, both)
         r : Ran <- run("ssh", ssh.args(peer, push.cmd(env.remote(e))), J.Json.show(C.Copy.json(both)))
         sync.pushed(peer, U32.from_nat(List.length(&2, C.Rec, both)), r)
 
-def sync.pulled.if(ok: Bool, +e: Env, +peer: String, +out: String, +err: String) -> IO(Unit):
+def sync.pulled.if(ok: Bool, +e: Env, +peer: String, +out: String, +err: String) -> IO(Bool):
   match ok:
     case True{}:
       sync.join(e, peer, J.Json.parse(out))
     case False{}:
-      IO.print_err(peer ++ ": " ++ String.trim(err))
+      failed(peer ++ ": " ++ String.trim(err))
 
-def sync.pulled(+e: Env, +peer: String, r: Ran) -> IO(Unit):
+def sync.pulled(+e: Env, +peer: String, r: Ran) -> IO(Bool):
   match r:
     case Ran{+c, +o, +x}:
       sync.pulled.if(U32.is_eq(c, 0), e, peer, o, x)
 
-def sync.peer(+e: Env, +peer: String) -> IO(Unit):
-  do IO<Unit>:
+def sync.peer(+e: Env, +peer: String) -> IO(Bool):
+  do IO<Bool>:
     r : Ran <- run("ssh", ssh.args(peer, env.remote(e) ++ " export"), "")
     sync.pulled(e, peer, r)
-
-def sync.all(+e: Env, peers: List<&2, String>) -> IO(Unit):
-  match peers:
-    case Nil{}:
-      IO.pure(Unit, Unit{})
-    case +p <> t:
-      do IO<Unit>:
-        sync.peer(e, p)
-        sync.all(e, t)
 
 def lines.kept(xs: List<&2, String>) -> List<&2, String>:
   match xs:
@@ -519,18 +522,6 @@ def args.list(xs: List<String>) -> List<&2, String>:
       Nil{}
     case +x <> t:
       x <> args.list(t)
-
-def sync.peers(+e: Env, given: List<&2, String>, file: Maybe<&2, String>) -> IO(Unit):
-  match given:
-    case Nil{}:
-      sync.all(e, lines.kept(String.lines(text.or(file, ""))))
-    case +g:
-      sync.all(e, g)
-
-def cmd.sync(+e: Env, xs: List<String>) -> IO(Unit):
-  do IO<Unit>:
-    m : Maybe<&2, String> <- file.read(env.dir(e) ++ "/peers")
-    sync.peers(e, args.list(xs), m)
 
 # Google
 # ------
@@ -678,8 +669,18 @@ def json.of(+what: String, r: Ran) -> IO(J.Json):
 def bearer.path(+e: Env) -> String:
   env.dir(e) ++ "/bearer"
 
+# A secret is written to a file made readable only by its owner before
+# anything is in it, then moved over the old one.
+def secret.write(+p: String, +data: String) -> IO(Unit):
+  do IO<Unit>:
+    c : Ran <- run("install", ["-m", "600", "/dev/null", p ++ ".tmp"], "")
+    must("making " ++ p ++ ".tmp", c)
+    file.write(p ++ ".tmp", data)
+    r : Ran <- run("mv", ["-f", p ++ ".tmp", p], "")
+    must("mv", r)
+
 def bearer.save(+e: Env, +token: String) -> IO(Unit):
-  file.write(bearer.path(e), "Authorization: Bearer " ++ token ++ "\n")
+  secret.write(bearer.path(e), "Authorization: Bearer " ++ token ++ "\n")
 
 def api.args(+e: Env, +method: String, +u: String, body: Bool) -> List<String>:
   match body:
@@ -706,14 +707,8 @@ def google.load(+e: Env) -> IO(J.Json):
     return J.Json.read(text.or(m, "{}"))
 
 def google.save(+e: Env, +refresh: String, +cal: String) -> IO(Unit):
-  do IO<Unit>:
-    +p : String = google.path(e)
-    file.write(p ++ ".tmp", J.Json.show(J.JObj{J.JField{"refresh_token", J.JStr{refresh},
-      J.JField{"calendar", J.JStr{cal}, J.JNil{}}}}) ++ "\n")
-    c : Ran <- run("chmod", ["600", p ++ ".tmp"], "")
-    must("chmod", c)
-    r : Ran <- run("mv", ["-f", p ++ ".tmp", p], "")
-    must("mv", r)
+  secret.write(google.path(e), J.Json.show(J.JObj{J.JField{"refresh_token", J.JStr{refresh},
+    J.JField{"calendar", J.JStr{cal}, J.JNil{}}}}) ++ "\n")
 
 # horas's own calendar in the account: made once, then kept by its id.
 def cal.make(+e: Env) -> IO(String):
@@ -774,6 +769,358 @@ def cmd.login(+e: Env, hint: List<String>) -> IO(Unit):
     browser.open(u)
     q : Listener & H.Got <- serve(1800n, (l, H.GotOther{}), state)
     login.done(q, e, cl, verifier)
+
+# Syncing with Google
+# -------------------
+#
+# Google's copy of horas's calendar is one more replica. Every event horas
+# writes there carries, in its private extended properties, the stamp of the
+# version written and the hash of its body. Read back, an event whose body
+# still has that hash is that version. One whose body does not was edited in
+# Google Calendar (on the web, on a phone): a new version, stamped with when
+# Google says it changed. So an edit on either side carries over to the
+# other, and of two edits to one event the later wins.
+
+def events.url(+cal: String) -> String:
+  google.api() ++ "/calendars/" ++ H.pct(cal) ++ "/events"
+
+def token.refresh(+cl: J.Json, +refresh: String) -> IO(Ran):
+  form.post("https://oauth2.googleapis.com/token", H.query([
+    H.Param{"client_id", J.Json.at(cl, "client_id")}, H.Param{"client_secret", J.Json.at(cl, "client_secret")},
+    H.Param{"refresh_token", refresh}, H.Param{"grant_type", "refresh_token"}]))
+
+# An event as Google holds it: whether it is a version horas wrote (its hash
+# still matches), that version's stamp (or, edited in Google, Google's time
+# of the edit), and its body.
+type GV is Data:
+  GV{+id: String, +ok: Bool, +at: C.Stamp, +body: C.Body}
+
+def gv.id(v: GV) -> String:
+  match v:
+    case GV{i, o, s, b}:
+      i
+
+def gv.if(ok: Bool, +id: String, s: C.Stamp, +b: C.Body, edit: C.Stamp) -> GV:
+  match ok:
+    case True{}:
+      GV{id, True{}, s, b}
+    case False{}:
+      GV{id, False{}, edit, b}
+
+def gv.stamped(m: Maybe<&2, C.Stamp>, +id: String, +hash: String, +b: C.Body, edit: C.Stamp) -> GV:
+  match m:
+    case None{}:
+      GV{id, False{}, edit, b}
+    case Some{s}:
+      gv.if(String.eq(hash, C.Body.hash(b)), id, s, b, edit)
+
+def gv.props(+zone: String, +j: J.Json, +p: J.Json) -> GV:
+  gv.stamped(C.Stamp.read(J.Json.at(p, "horas")), J.Json.at(j, "id"), J.Json.at(p, "horas_hash"),
+    C.Body.google(j, zone), C.Stamp{J.Json.at(j, "updated"), 0, "google"})
+
+def gv.of(+zone: String, +j: J.Json) -> GV:
+  gv.props(zone, j, J.Json.get(J.Json.get(j, "extendedProperties"), "private"))
+
+def gvs.of(+zone: String, xs: List<&2, J.Json>) -> List<&2, GV>:
+  match xs:
+    case Nil{}:
+      Nil{}
+    case x <> t:
+      gv.of(zone, x) <> gvs.of(zone, t)
+
+def gv.find(vs: List<&2, GV>, +id: String) -> Maybe<&2, GV>:
+  match vs:
+    case Nil{}:
+      None{}
+    case +v <> t:
+      Bool.pick(Maybe<&2, GV>, String.eq(gv.id(v), id), Some{v}, gv.find(t, id))
+
+# What Google's copy adds: every version horas wrote (the join keeps the
+# later), and every event edited in Google whose body is not the one here
+# (one that only Google ever had, and that is deleted there, is left out).
+def gv.new(m: Maybe<&2, C.Rec>, +b: C.Body) -> Bool:
+  match m:
+    case None{}:
+      C.Body.live(b)
+    case Some{r}:
+      Bool.not(C.Body.same(C.Rec.body(r), b))
+
+def gv.rec.if(keep: Bool, +i: String, s: C.Stamp, b: C.Body) -> List<&2, C.Rec>:
+  match keep:
+    case True{}:
+      [C.Rec{i, s, b}]
+    case False{}:
+      Nil{}
+
+def gv.rec(v: GV, +copy: List<&2, C.Rec>) -> List<&2, C.Rec>:
+  match v:
+    case GV{+i, o, s, +b}:
+      gv.rec.if(Bool.or(o, gv.new(C.Copy.find(copy, i), b)), i, s, b)
+
+def gv.recs(vs: List<&2, GV>, +copy: List<&2, C.Rec>) -> List<&2, C.Rec>:
+  match vs:
+    case Nil{}:
+      Nil{}
+    case v <> t:
+      List.append(&2, C.Rec, gv.rec(v, copy), gv.recs(t, copy))
+
+# What horas writes to Google: the body, its stamp and its hash.
+def obj.fields(j: J.Json) -> J.Json:
+  match j:
+    case J.JObj{fs}:
+      fs
+    case _:
+      J.JNil{}
+
+def ev.json(+id: String, s: C.Stamp, +b: C.Body) -> String:
+  J.Json.show(J.JObj{J.JField{"id", J.JStr{id},
+    J.JField{"extendedProperties", J.JObj{J.JField{"private", J.JObj{
+      J.JField{"horas", J.JStr{C.Stamp.show(s)},
+      J.JField{"horas_hash", J.JStr{C.Body.hash(b)}, J.JNil{}}}}, J.JNil{}}},
+    obj.fields(C.Body.json(b))}}})
+
+def rec.ev(r: C.Rec) -> String:
+  match r:
+    case C.Rec{i, s, b}:
+      ev.json(i, s, b)
+
+def cmp.is_eq(c: Cmp) -> Bool:
+  match c:
+    case EQ{}:
+      True{}
+    case _:
+      False{}
+
+def stamp.eq(a: C.Stamp, b: C.Stamp) -> Bool:
+  cmp.is_eq(C.Stamp.order(a, b))
+
+# Google keeps no event without a start.
+def When.set(w: C.When) -> Bool:
+  match w:
+    case C.NoTime{}:
+      False{}
+    case _:
+      True{}
+
+# For each record here: Google has its version (skip), lacks the event
+# (insert it, unless it is deleted), or has another version (patch it).
+type Act is Data:
+  Skip{}
+  Insert{}
+  Patch{}
+
+def act.had(v: GV, +r: C.Rec) -> Act:
+  match v:
+    case GV{i, o, s, b}:
+      Bool.pick(Act, Bool.or(Bool.and(o, stamp.eq(s, C.Rec.at(r))), Bool.not(When.set(C.Body.start(C.Rec.body(r))))),
+        Skip{}, Patch{})
+
+def act.of(m: Maybe<&2, GV>, +r: C.Rec) -> Act:
+  match m:
+    case None{}:
+      Bool.pick(Act, Bool.and(C.Rec.live(r), When.set(C.Body.start(C.Rec.body(r)))), Insert{}, Skip{})
+    case Some{v}:
+      act.had(v, r)
+
+# 0: nothing to write, 1: written, 2: Google refused it.
+def wrote.if(ok: Bool, +id: String, +err: String) -> IO(U32):
+  match ok:
+    case True{}:
+      IO.pure(U32, 1)
+    case False{}:
+      do IO<U32>:
+        IO.print_err("google: " ++ String.take(id, 8n) ++ ": " ++ String.trim(err))
+        return 2
+
+def wrote(+id: String, r: Ran) -> IO(U32):
+  match r:
+    case Ran{+c, +o, +x}:
+      wrote.if(U32.is_eq(c, 0), id, o ++ " " ++ x)
+
+def act.run(a: Act, +e: Env, +cal: String, +r: C.Rec) -> IO(U32):
+  match a:
+    case Skip{}:
+      IO.pure(U32, 0)
+    case Insert{}:
+      do IO<U32>:
+        x : Ran <- api(e, "POST", events.url(cal), rec.ev(r))
+        wrote(C.Rec.id(r), x)
+    case Patch{}:
+      do IO<U32>:
+        x : Ran <- api(e, "PATCH", events.url(cal) ++ "/" ++ C.Rec.id(r), rec.ev(r))
+        wrote(C.Rec.id(r), x)
+
+type Tally is Data:
+  Tally{+wrote: U32, +failed: U32}
+
+def one.if(+k: U32, +v: U32) -> U32:
+  Bool.pick(U32, U32.is_eq(k, v), 1, 0)
+
+def tally.add(t: Tally, +k: U32) -> Tally:
+  match t:
+    case Tally{w, f}:
+      Tally{(w + one.if(k, 1) : U32), (f + one.if(k, 2) : U32)}
+
+def push.all(+e: Env, +cal: String, +vs: List<&2, GV>, rs: List<&2, C.Rec>, t: Tally) -> IO(Tally):
+  match rs:
+    case Nil{}:
+      IO.pure(Tally, t)
+    case +r <> rest:
+      do IO<Tally>:
+        k : U32 <- act.run(act.of(gv.find(vs, C.Rec.id(r)), r), e, cal, r)
+        push.all(e, cal, vs, rest, tally.add(t, k))
+
+# Reading Google's copy, a page (up to 2500 events) at a time, deleted
+# events too.
+type Pages is Data:
+  PMore{+token: String, +items: List<&2, J.Json>}
+  PDone{+items: List<&2, J.Json>}
+  PFail{+why: String}
+
+def page.url(+cal: String, +tok: String) -> String:
+  H.url(events.url(cal), List.append(&2, H.Param, [H.Param{"showDeleted", "true"}, H.Param{"maxResults", "2500"}],
+    Bool.pick(List<&2, H.Param>, String.is_empty(tok), Nil{}, [H.Param{"pageToken", tok}])))
+
+def page.more(last: Bool, +tok: String, xs: List<&2, J.Json>) -> Pages:
+  match last:
+    case True{}:
+      PDone{xs}
+    case False{}:
+      PMore{tok, xs}
+
+def page.of(+j: J.Json, acc: List<&2, J.Json>) -> Pages:
+  page.more(String.is_empty(J.Json.at(j, "nextPageToken")), J.Json.at(j, "nextPageToken"),
+    List.append(&2, J.Json, acc, J.Json.items(J.Json.get(j, "items"))))
+
+def page.if(ok: Bool, +o: String, +x: String, acc: List<&2, J.Json>) -> Pages:
+  match ok:
+    case True{}:
+      page.of(J.Json.read(o), acc)
+    case False{}:
+      PFail{String.trim(o ++ " " ++ x)}
+
+def page.step(r: Ran, acc: List<&2, J.Json>) -> Pages:
+  match r:
+    case Ran{+c, +o, +x}:
+      page.if(U32.is_eq(c, 0), o, x, acc)
+
+def pages(fuel: Nat, +e: Env, +cal: String, st: Pages) -> IO(Maybe<&2, List<&2, J.Json>>):
+  match fuel:
+    case 0n:
+      IO.pure(Maybe<&2, List<&2, J.Json>>, None{})
+    case 1n+f:
+      match st:
+        case PDone{xs}:
+          IO.pure(Maybe<&2, List<&2, J.Json>>, Some{xs})
+        case PFail{+why}:
+          do IO<Maybe<&2, List<&2, J.Json>>>:
+            IO.print_err("google: reading the calendar failed: " ++ why)
+            return None{}
+        case PMore{+tok, xs}:
+          do IO<Maybe<&2, List<&2, J.Json>>>:
+            r : Ran <- api(e, "GET", page.url(cal, tok), "")
+            pages(f, e, cal, page.step(r, xs))
+
+def google.said(+n: U32, t: Tally) -> IO(Bool):
+  match t:
+    case Tally{+w, +f}:
+      say.if(U32.is_eq(f, 0), "google", "in sync, " ++ U32.show(n) ++ " records, " ++ U32.show(w) ++ " written",
+        U32.show(f) ++ " events not written, " ++ U32.show(w) ++ " written")
+
+# Google's changes join the copy here, then whatever Google lacks is written.
+def google.join(+e: Env, +cal: String, +vs: List<&2, GV>) -> IO(Bool):
+  do IO<Bool>:
+    +copy : List<&2, C.Rec> <- load(e)
+    +both : List<&2, C.Rec> = C.join(copy, C.Copy.of(gv.recs(vs, copy)))
+    save(e, both)
+    t : Tally <- push.all(e, cal, vs, both, Tally{0, 0})
+    google.said(U32.from_nat(List.length(&2, C.Rec, both)), t)
+
+def google.listed(+e: Env, +cal: String, ms: Maybe<&2, List<&2, J.Json>>) -> IO(Bool):
+  match ms:
+    case None{}:
+      IO.pure(Bool, False{})
+    case Some{xs}:
+      google.join(e, cal, gvs.of(env.zone(e), xs))
+
+def google.fresh(ok: Bool, +e: Env, +cal: String, +o: String, +x: String) -> IO(Bool):
+  match ok:
+    case False{}:
+      failed("google: renewing the sign-in failed (run horas login again?): " ++ String.trim(o ++ " " ++ x))
+    case True{}:
+      do IO<Bool>:
+        bearer.save(e, J.Json.at(J.Json.read(o), "access_token"))
+        ms : Maybe<&2, List<&2, J.Json>> <- pages(1000n, e, cal, PMore{"", Nil{}})
+        google.listed(e, cal, ms)
+
+def google.refreshed(+e: Env, +cal: String, r: Ran) -> IO(Bool):
+  match r:
+    case Ran{+c, +o, +x}:
+      google.fresh(U32.is_eq(c, 0), e, cal, o, x)
+
+def google.with(+e: Env, +g: J.Json) -> IO(Bool):
+  do IO<Bool>:
+    +cl : J.Json <- client.load(e)
+    r : Ran <- token.refresh(cl, J.Json.at(g, "refresh_token"))
+    google.refreshed(e, J.Json.at(g, "calendar"), r)
+
+def google.signed(+e: Env, m: Maybe<&2, String>) -> IO(Bool):
+  match m:
+    case None{}:
+      failed("google: this machine is not signed in (horas login)")
+    case Some{s}:
+      google.with(e, J.Json.read(s))
+
+def sync.google(+e: Env) -> IO(Bool):
+  do IO<Bool>:
+    m : Maybe<&2, String> <- file.read(google.path(e))
+    google.signed(e, m)
+
+# Sync: every replica named ("google" is Google's copy), or else Google's
+# (once this machine is signed in) and the peers in $HORAS_DIR/peers.
+def sync.one(is_google: Bool, +e: Env, +p: String) -> IO(Bool):
+  match is_google:
+    case True{}:
+      sync.google(e)
+    case False{}:
+      sync.peer(e, p)
+
+def sync.all(+e: Env, peers: List<&2, String>, ok: Bool) -> IO(Bool):
+  match peers:
+    case Nil{}:
+      IO.pure(Bool, ok)
+    case +p <> t:
+      do IO<Bool>:
+        k : Bool <- sync.one(String.eq(p, "google"), e, p)
+        sync.all(e, t, Bool.and(ok, k))
+
+def signed.in(m: Maybe<&2, String>) -> List<&2, String>:
+  match m:
+    case None{}:
+      Nil{}
+    case Some{s}:
+      ["google"]
+
+def sync.peers(+e: Env, given: List<&2, String>, file: Maybe<&2, String>, g: Maybe<&2, String>) -> IO(Bool):
+  match given:
+    case Nil{}:
+      sync.all(e, List.append(&2, String, signed.in(g), lines.kept(String.lines(text.or(file, "")))), True{})
+    case +p:
+      sync.all(e, p, True{})
+
+def sync.end(ok: Bool) -> IO(Unit):
+  match ok:
+    case True{}:
+      IO.pure(Unit, Unit{})
+    case False{}:
+      IO.die(Unit, 1, "horas: sync did not reach every replica")
+
+def cmd.sync(+e: Env, xs: List<String>) -> IO(Unit):
+  do IO<Unit>:
+    m : Maybe<&2, String> <- file.read(env.dir(e) ++ "/peers")
+    g : Maybe<&2, String> <- file.read(google.path(e))
+    ok : Bool <- sync.peers(e, args.list(xs), m, g)
+    sync.end(ok)
 
 # The command line
 # ----------------
