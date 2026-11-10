@@ -1,5 +1,5 @@
 {
-  # horas (working name): a calendar in Bend, one copy per machine, joined
+  # horas: a calendar in Bend, one copy per machine, joined
   # over ssh and with Google Calendar. The program is Main.bend and
   # the files it imports; this flake only builds it and names the programs
   # it runs (ssh, curl, date, mv, mkdir, mktemp, chmod, sha256sum; and
