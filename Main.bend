@@ -2,6 +2,7 @@ import Base
 import ./Json.bend as J
 import ./Cal.bend as C
 import ./Http.bend as H
+import ./Slots.bend as S
 
 # horas: the command line. One copy of the calendar per machine, in
 # $HORAS_DIR/copy.json (default ~/.local/share/horas); `sync` joins it with
@@ -19,6 +20,10 @@ import ./Http.bend as H
 #   horas export              (the copy, as JSON: what a peer's sync reads)
 #   horas import FILE         (joins a copy written by export)
 #   horas login [ACCOUNT]     (signs this machine in to Google, once)
+#   horas slots [OPTION...]   (the open slots for a call, as JSON; see
+#                             "Open slots" below)
+#   horas publish [OPTION...] (syncs, writes the slots into a site's
+#                             public/slots.json and commits it; no push)
 #
 # WHEN is a day, 2026-11-29, or a time there, 2026-11-29T19:00 (or with a
 # space for the T), in $HORAS_TZ (default America/Mexico_City). Without
@@ -1122,6 +1127,473 @@ def cmd.sync(+e: Env, xs: List<String>) -> IO(Unit):
     ok : Bool <- sync.peers(e, args.list(xs), m, g)
     sync.end(ok)
 
+# Open slots
+# ----------
+#
+# `horas slots` lists the open slots for a call: by default 30 minutes each,
+# over the next 14 days, Monday to Friday 09:00-17:00 in $HORAS_TZ, at least
+# 4 hours from now, around this machine's copy of the calendar. It writes
+# them as JSON for a web page to offer: the slots' starts (UTC), the zone and
+# when the list was made; never an event's title, notes or times.
+#
+# Which slots are open is Slots.bend (its laws are in LAWS.bend, proven in
+# PROOF.bend); here are only the options, and the times turned into minutes.
+# A zone's clock is read by `date` (the tz database), one call for all of
+# them.
+#
+# An event that repeats (RRULE) counts as busy only at its first time, since
+# horas keeps no other: `slots` says so on stderr.
+
+# The value after an option, or d.
+def sopt(xs: List<&2, String>, +k: String, +d: String) -> String:
+  match xs:
+    case Nil{}:
+      d
+    case "--no-sync" <> t:
+      sopt(t, k, d)
+    case +x <> +v <> t:
+      Bool.pick(String, String.eq(x, k), v, sopt(t, k, d))
+    case _:
+      d
+
+def sopt.has(xs: List<&2, String>, +k: String) -> Bool:
+  List.contains(~String, ~String.eq, xs, k)
+
+def sopt.known(+k: String) -> Bool:
+  List.contains(~String, ~String.eq, ["--ahead", "--hours", "--days", "--length", "--notice", "--out", "--site"], k)
+
+def sopts.ok(xs: List<&2, String>) -> Bool:
+  match xs:
+    case Nil{}:
+      True{}
+    case "--no-sync" <> t:
+      sopts.ok(t)
+    case +k <> v <> t:
+      Bool.and(sopt.known(k), sopts.ok(t))
+    case _:
+      False{}
+
+def slots.usage() -> String:
+  "usage: horas slots [--ahead DAYS] [--hours HH:MM-HH:MM[,...]] [--days mon-fri] [--length MIN] [--notice MIN] [--out FILE]\n" ++
+  "       horas publish [the same, but --site DIR for --out] [--no-sync]\n" ++
+  "defaults: --ahead 14 --hours 09:00-17:00 --days mon-fri --length 30 --notice 240, in $HORAS_TZ;\n" ++
+  "publish writes DIR/public/slots.json (DIR: ~/src/hhefesto.com) and commits it there; it does not push"
+
+def opts.check(ok: Bool, +why: String) -> IO(Unit):
+  match ok:
+    case True{}:
+      IO.pure(Unit, Unit{})
+    case False{}:
+      IO.die(Unit, 2, "horas: " ++ why ++ "\n" ++ slots.usage())
+
+# Working hours: "09:00-17:00", or several, "09:00-13:00,15:00-18:00".
+type Hours is Data:
+  Hours{+from: String, +to: String}
+
+def hm(+s: String) -> U32:
+  ((num(s, 0n, 2n) * 60) + num(s, 3n, 2n) : U32)
+
+def hm.ok(+s: String) -> Bool:
+  Bool.and(U32.is_lt(num(s, 3n, 2n), 60), U32.is_le(hm(s), 1440))
+
+def hours.one(+s: String) -> Maybe<&2, Hours>:
+  +a : String = String.take(s, 5n)
+  +b : String = String.drop(s, 6n)
+  Bool.pick(Maybe<&2, Hours>,
+    Bool.and(shape(s, "dd:dd-dd:dd"), Bool.and(Bool.and(hm.ok(a), hm.ok(b)), U32.is_lt(hm(a), hm(b)))),
+    Some{Hours{a, b}}, None{})
+
+def hours.all(xs: List<&2, String>) -> Maybe<&2, List<&2, Hours>>:
+  match xs:
+    case Nil{}:
+      Some{Nil{}}
+    case +x <> t:
+      do Maybe<&2, List<&2, Hours>>:
+        h : Hours <- hours.one(String.trim(x))
+        r : List<&2, Hours> <- hours.all(t)
+        return h <> r
+
+# Days of the week, 1 (Monday) to 7: "mon-fri", "mon,wed,fri", "1-5".
+def wd.go(+s: String, names: List<&2, String>, +n: U32) -> U32:
+  match names:
+    case Nil{}:
+      0
+    case +x <> t:
+      Bool.pick(U32, Bool.or(String.eq(s, x), String.eq(s, U32.show(n))), n, wd.go(s, t, (n + 1 : U32)))
+
+def wd.of(+s: String) -> U32:
+  wd.go(String.to_lower(String.trim(s)), ["mon", "tue", "wed", "thu", "fri", "sat", "sun"], 1)
+
+def wd.range(n: Nat, +a: U32) -> List<&2, U32>:
+  match n:
+    case 0n:
+      Nil{}
+    case 1n+p:
+      a <> wd.range(p, (a + 1 : U32))
+
+def wd.span(+a: U32, +b: U32) -> Maybe<&2, List<&2, U32>>:
+  Bool.pick(Maybe<&2, List<&2, U32>>, Bool.and(U32.is_lt(0, a), U32.is_le(a, b)),
+    Some{wd.range(U32.to_nat(((b - a) + 1 : U32)), a)}, None{})
+
+def wd.part(ps: List<&2, String>) -> Maybe<&2, List<&2, U32>>:
+  match ps:
+    case +a <> Nil{}:
+      wd.span(wd.of(a), wd.of(a))
+    case +a <> +b <> Nil{}:
+      wd.span(wd.of(a), wd.of(b))
+    case _:
+      None{}
+
+def wd.all(xs: List<&2, String>) -> Maybe<&2, List<&2, U32>>:
+  match xs:
+    case Nil{}:
+      Some{Nil{}}
+    case x <> t:
+      do Maybe<&2, List<&2, U32>>:
+        a : List<&2, U32> <- wd.part(String.split(x, '-'))
+        r : List<&2, U32> <- wd.all(t)
+        return List.append(&2, U32, a, r)
+
+def bounded(m: Maybe<&2, U32>, +lo: U32, +hi: U32) -> Maybe<&2, U32>:
+  match m:
+    case None{}:
+      None{}
+    case Some{+v}:
+      Bool.pick(Maybe<&2, U32>, Bool.and(U32.is_le(lo, v), U32.is_le(v, hi)), Some{v}, None{})
+
+type Cfg is Data:
+  Cfg{+ahead: U32, +hours: List<&2, Hours>, +days: List<&2, U32>, +len: U32, +notice: U32}
+
+def cfg.of(+os: List<&2, String>) -> Maybe<&2, Cfg>:
+  do Maybe<&2, Cfg>:
+    +ahead : U32 <- bounded(U32.read(sopt(os, "--ahead", "14")), 1, 366)
+    +hs : List<&2, Hours> <- hours.all(String.split(sopt(os, "--hours", "09:00-17:00"), ','))
+    +ds : List<&2, U32> <- wd.all(String.split(sopt(os, "--days", "mon-fri"), ','))
+    +len : U32 <- bounded(U32.read(sopt(os, "--length", "30")), 5, 1440)
+    +notice : U32 <- bounded(U32.read(sopt(os, "--notice", "240")), 0, 43200)
+    return Cfg{ahead, hs, ds, len, notice}
+
+def cfg.or(m: Maybe<&2, Cfg>) -> IO(Cfg):
+  match m:
+    case None{}:
+      IO.die(Cfg, 2, "horas: an option's value is not one slots reads\n" ++ slots.usage())
+    case Some{c}:
+      IO.pure(Cfg, c)
+
+# The days from d on, n of them, that are working days.
+def horizon(n: Nat, +d: String, +ds: List<&2, U32>) -> List<&2, String>:
+  match n:
+    case 0n:
+      Nil{}
+    case 1n+p:
+      List.filter.put(String, d, horizon(p, S.Date.add(d, 1), ds),
+        List.contains(~U32, ~U32.is_eq, ds, S.Date.weekday(d)))
+
+# A clock time in a zone, as `date` reads it: TZ="America/Mexico_City" 2026-11-18 09:00
+def zline(+zone: String, +date: String, +clock: String) -> String:
+  "TZ=\"" ++ zone ++ "\" " ++ date ++ " " ++ clock
+
+# 24:00 is the next day's 00:00 (date does not read 24:00).
+def end.line(+zone: String, +date: String, +clock: String) -> String:
+  Bool.pick(String, String.eq(clock, "24:00"), zline(zone, S.Date.add(date, 1), "00:00"), zline(zone, date, clock))
+
+def win.lines(hs: List<&2, Hours>, +zone: String, +date: String) -> List<&2, String>:
+  match hs:
+    case Nil{}:
+      Nil{}
+    case Hours{+a, +b} <> t:
+      zline(zone, date, a) <> end.line(zone, date, b) <> win.lines(t, zone, date)
+
+def wins.lines(ds: List<&2, String>, +hs: List<&2, Hours>, +zone: String) -> List<&2, String>:
+  match ds:
+    case Nil{}:
+      Nil{}
+    case +d <> t:
+      List.append(&2, String, win.lines(hs, zone, d), wins.lines(t, hs, zone))
+
+# A zone name from an event is passed to date only if it looks like one
+# ("Europe/Madrid", "Etc/GMT+6"); otherwise the event is read in $HORAS_TZ.
+def zchar(c: Char) -> Bool:
+  match c:
+    case Chr{+x}:
+      Bool.or(Bool.or(Bool.and(U32.is_ge(x, 65), U32.is_le(x, 90)), Bool.and(U32.is_ge(x, 97), U32.is_le(x, 122))),
+        Bool.or(Bool.and(U32.is_ge(x, 43), U32.is_le(x, 57)), U32.is_eq(x, 95)))
+
+def zchars(s: String) -> Bool:
+  match s:
+    case SNil{}:
+      True{}
+    case SCon{c, t}:
+      Bool.and(zchar(c), zchars(t))
+
+def zone.fit(+z: String, +work: String) -> String:
+  Bool.pick(String, Bool.and(zchars(z), Bool.not(String.is_empty(z))), z, work)
+
+# An event's start and end as two lines for date, if it is live and may
+# touch the days lo..hi; an all-day event is busy all day in $HORAS_TZ.
+def day.end(en: C.When, +d: String) -> String:
+  match en:
+    case C.Day{+d2}:
+      Bool.pick(String, String.is_gt(d2, d), d2, S.Date.add(d, 1))
+    case _:
+      S.Date.add(d, 1)
+
+def at.end(en: C.When, +st: C.When) -> C.When:
+  match en:
+    case C.At{t, z}:
+      C.At{t, z}
+    case _:
+      When.after(st)
+
+def near(+a: String, +b: String, +lo: String, +hi: String) -> Bool:
+  Bool.and(String.is_le(String.take(a, 10n), hi), String.is_ge(String.take(b, 10n), lo))
+
+def at.lines(+t: String, +z: String, en: C.When, +work: String, +lo: String, +hi: String) -> List<&2, String>:
+  match en:
+    case C.At{+t2, +z2}:
+      Bool.pick(List<&2, String>, near(t, t2, lo, hi),
+        [zline(zone.fit(z, work), String.take(t, 10n), String.drop(t, 11n)),
+         zline(zone.fit(z2, work), String.take(t2, 10n), String.drop(t2, 11n))], Nil{})
+    case _:
+      Nil{}
+
+def when.lines(st: C.When, en: C.When, +work: String, +lo: String, +hi: String) -> List<&2, String>:
+  match st:
+    case C.NoTime{}:
+      Nil{}
+    case C.Day{+d}:
+      +e : String = day.end(en, d)
+      Bool.pick(List<&2, String>, near(d, e, lo, hi), [zline(work, d, "00:00"), zline(work, e, "00:00")], Nil{})
+    case C.At{+t, +z}:
+      at.lines(t, z, at.end(en, C.At{t, z}), work, lo, hi)
+
+def busy.lines.of(b: C.Body, +work: String, +lo: String, +hi: String) -> List<&2, String>:
+  match b:
+    case C.Body{l, ti, no, pl, st, en, rr}:
+      Bool.pick(List<&2, String>, l, when.lines(st, en, work, lo, hi), Nil{})
+
+def busy.lines(xs: List<&2, C.Rec>, +work: String, +lo: String, +hi: String) -> List<&2, String>:
+  match xs:
+    case Nil{}:
+      Nil{}
+    case x <> t:
+      List.append(&2, String, busy.lines.of(C.Rec.body(x), work, lo, hi), busy.lines(t, work, lo, hi))
+
+# The live events that repeat, by title.
+def repeats.of(b: C.Body) -> List<&2, String>:
+  match b:
+    case C.Body{l, +ti, no, pl, st, en, rr}:
+      Bool.pick(List<&2, String>, Bool.and(l, Bool.not(List.is_empty(&2, String, rr))), [ti], Nil{})
+
+def repeats(xs: List<&2, C.Rec>) -> List<&2, String>:
+  match xs:
+    case Nil{}:
+      Nil{}
+    case x <> t:
+      List.append(&2, String, repeats.of(C.Rec.body(x)), repeats(t))
+
+def warn.all(xs: List<&2, String>) -> IO(Unit):
+  match xs:
+    case Nil{}:
+      IO.pure(Unit, Unit{})
+    case x <> t:
+      do IO<Unit>:
+        IO.print_err("horas slots: \"" ++ x ++ "\" repeats; only its first time counts as busy")
+        warn.all(t)
+
+# What date printed, one number per line, n of them.
+def secs.all(xs: List<&2, String>) -> Maybe<&2, List<&2, U32>>:
+  match xs:
+    case Nil{}:
+      Some{Nil{}}
+    case x <> t:
+      do Maybe<&2, List<&2, U32>>:
+        v : U32 <- U32.read(String.trim(x))
+        r : List<&2, U32> <- secs.all(t)
+        return v <> r
+
+def secs.n(m: Maybe<&2, List<&2, U32>>, +n: Nat) -> Maybe<&2, List<&2, U32>>:
+  match m:
+    case None{}:
+      None{}
+    case Some{+xs}:
+      Bool.pick(Maybe<&2, List<&2, U32>>, Nat.is_eq(List.length(&2, U32, xs), n), Some{xs}, None{})
+
+def secs.or(m: Maybe<&2, List<&2, U32>>, +err: String) -> IO(List<&2, U32>):
+  match m:
+    case None{}:
+      IO.die(List<&2, U32>, 1, "horas: date could not read every time: " ++ String.trim(err))
+    case Some{xs}:
+      IO.pure(List<&2, U32>, xs)
+
+def secs.ran(r: Ran, +n: Nat) -> IO(List<&2, U32>):
+  match r:
+    case Ran{+c, o, +e}:
+      secs.or(Bool.pick(Maybe<&2, List<&2, U32>>, U32.is_eq(c, 0), secs.n(secs.all(String.lines(String.trim(o))), n), None{}), e)
+
+# Seconds since 1970 of each line (`date -f - +%s`).
+def secs.of(+lines: List<&2, String>) -> IO(List<&2, U32>):
+  match lines:
+    case Nil{}:
+      IO.pure(List<&2, U32>, Nil{})
+    case _:
+      do IO<List<&2, U32>>:
+        r : Ran <- run("date", ["-f", "-", "+%s"], String.join(lines, "\n") ++ "\n")
+        secs.ran(r, List.length(&2, String, lines))
+
+# Pairs of seconds as spans of minutes: a window's ends are whole minutes;
+# a busy span is widened to whole minutes.
+def wins.of(xs: List<&2, U32>) -> List<&2, S.Span>:
+  match xs:
+    case +a <> +b <> t:
+      S.Span{(a / 60 : U32), (b / 60 : U32)} <> wins.of(t)
+    case _:
+      Nil{}
+
+def busy.of(xs: List<&2, U32>) -> List<&2, S.Span>:
+  match xs:
+    case +a <> +b <> t:
+      S.Span{(a / 60 : U32), ((b + 59) / 60 : U32)} <> busy.of(t)
+    case _:
+      Nil{}
+
+def starts(xs: List<&2, S.Span>) -> List<&2, String>:
+  match xs:
+    case Nil{}:
+      Nil{}
+    case x <> t:
+      S.Min.iso(S.Span.a(x)) <> starts(t)
+
+# The slots, as the JSON a page reads, with how many and when.
+type Made is Data:
+  Made{+json: String, +n: U32, +at: String}
+
+def Made.json(m: Made) -> String:
+  match m:
+    case Made{j, n, at}:
+      j
+
+def made.of(+zone: String, +at: String, sl: List<&2, S.Span>) -> Made:
+  +ss : List<&2, String> = starts(sl)
+  Made{J.Json.show(J.JObj{J.JField{"zone", J.JStr{zone}, J.JField{"generated", J.JStr{at},
+         J.JField{"slots", J.JArr{J.Json.strs(ss)}, J.JNil{}}}}}) ++ "\n",
+       U32.from_nat(List.length(&2, String, ss)), at}
+
+# Today in the zone, and the second now.
+def clock.of(r: Ran) -> IO(String & U32):
+  match r:
+    case Ran{+c, +o, +e}:
+      do IO<String & U32>:
+        must.if(Bool.and(U32.is_eq(c, 0), Maybe.is_some(&2, U32, U32.read(String.drop(String.trim(o), 11n)))), "date", e ++ o)
+        return (String.take(String.trim(o), 10n), Maybe.default(&2, U32, U32.read(String.drop(String.trim(o), 11n)), 0))
+
+def slots.at(+e: Env, cfg: Cfg, tn: String & U32) -> IO(Made):
+  match cfg:
+    case Cfg{+ahead, +hs, +ds, +len, +notice}:
+      match tn:
+        case (+today, +now):
+          do IO<Made>:
+            +zone : String = env.zone(e)
+            +copy : List<&2, C.Rec> <- load(e)
+            +days : List<&2, String> = horizon(U32.to_nat(ahead), today, ds)
+            ws : List<&2, U32> <- secs.of(wins.lines(days, hs, zone))
+            bs : List<&2, U32> <- secs.of(busy.lines(copy, zone, S.Date.add(today, 4294967295), S.Date.add(today, ahead)))
+            warn.all(repeats(copy))
+            return made.of(zone, S.Sec.iso(now), S.slots(((now / 60) + notice : U32), len, wins.of(ws), busy.of(bs)))
+
+def slots.with(+e: Env, cfg: Cfg) -> IO(Made):
+  do IO<Made>:
+    r : Ran <- run("env", ["TZ=" ++ env.zone(e), "date", "+%Y-%m-%d %s"], "")
+    tn : String & U32 <- clock.of(r)
+    slots.at(e, cfg, tn)
+
+def slots.make(+e: Env, +os: List<&2, String>) -> IO(Made):
+  do IO<Made>:
+    +cfg : Cfg <- cfg.or(cfg.of(os))
+    slots.with(e, cfg)
+
+# A file put in place whole (a page may be reading it).
+def file.put(+p: String, data: String) -> IO(Unit):
+  do IO<Unit>:
+    file.write(p ++ ".tmp", data)
+    r : Ran <- run("mv", ["-f", p ++ ".tmp", p], "")
+    must("mv", r)
+
+def slots.to(stdout: Bool, +path: String, m: Made) -> IO(Unit):
+  match stdout m:
+    case True{} Made{j, n, at}:
+      IO.print(String.trim(j))
+    case False{} Made{j, +n, +at}:
+      do IO<Unit>:
+        file.put(path, j)
+        IO.print_err(path ++ ": " ++ U32.show(n) ++ " open slots, generated " ++ at)
+
+def slots.out(+path: String, m: Made) -> IO(Unit):
+  slots.to(String.is_empty(path), path, m)
+
+def cmd.slots(+e: Env, xs: List<String>) -> IO(Unit):
+  do IO<Unit>:
+    +os : List<&2, String> = args.list(xs)
+    opts.check(Bool.and(sopts.ok(os), Bool.not(sopt.has(os, "--no-sync"))), "slots takes these options")
+    m : Made <- slots.make(e, os)
+    slots.out(sopt(os, "--out", ""), m)
+
+# Publishing
+# ----------
+#
+# `horas publish` syncs (unless --no-sync), writes the slots into the site's
+# public/slots.json and commits that one file in the site's repository, on
+# whatever branch is checked out. It never pushes: pushing the site deploys
+# it, and that is the owner's call.
+
+def publish.sync(skip: Bool, +e: Env) -> IO(Bool):
+  match skip:
+    case True{}:
+      IO.pure(Bool, True{})
+    case False{}:
+      do IO<Bool>:
+        m : Maybe<&2, String> <- file.read(env.dir(e) ++ "/peers")
+        g : Maybe<&2, String> <- file.read(google.path(e))
+        sync.peers(e, Nil{}, m, g)
+
+def git(+site: String, args: List<String>) -> IO(Ran):
+  run("git", "-C" <> site <> args, "")
+
+def publish.commit(changed: Bool, +site: String, m: Made) -> IO(Unit):
+  match changed:
+    case False{}:
+      IO.print(site ++ "/public/slots.json is unchanged; nothing to commit")
+    case True{}:
+      match m:
+        case Made{j, +n, +at}:
+          do IO<Unit>:
+            c : Ran <- git(site, ["commit", "-q", "-m", "Open slots for a free call: " ++ U32.show(n) ++ ", generated " ++ at ++ " (horas publish)", "--", "public/slots.json"])
+            must("git commit", c)
+            h : Ran <- git(site, ["log", "-1", "--format=%h"])
+            b : Ran <- git(site, ["rev-parse", "--abbrev-ref", "HEAD"])
+            IO.print("committed " ++ out.of(h) ++ " on " ++ out.of(b) ++ " in " ++ site ++ ": " ++ U32.show(n) ++ " open slots, generated " ++ at)
+            IO.print("not pushed: git -C " ++ site ++ " push puts them on the site")
+
+def ran.code(r: Ran) -> U32:
+  match r:
+    case Ran{c, o, e}:
+      c
+
+def cmd.publish(+e: Env, xs: List<String>) -> IO(Unit):
+  do IO<Unit>:
+    +os : List<&2, String> = args.list(xs)
+    opts.check(Bool.and(sopts.ok(os), Bool.not(sopt.has(os, "--out"))), "publish takes these options")
+    home : String <- env.get("HOME", "/tmp")
+    +site : String = sopt(os, "--site", home ++ "/src/hhefesto.com")
+    ok : Bool <- publish.sync(sopt.has(os, "--no-sync"), e)
+    must.if(ok, "publishing", "sync did not reach every replica, so nothing was published (--no-sync publishes from this copy as it is)")
+    +m : Made <- slots.make(e, os)
+    file.put(site ++ "/public/slots.json", Made.json(m))
+    a : Ran <- git(site, ["add", "--", "public/slots.json"])
+    must("git add", a)
+    d : Ran <- git(site, ["diff", "--cached", "--quiet", "--", "public/slots.json"])
+    publish.commit(U32.is_eq(ran.code(d), 1), site, m)
+
 # The command line
 # ----------------
 
@@ -1131,6 +1603,7 @@ def usage() -> String:
   "       horas edit ID [--title T] [--start WHEN] [--end WHEN] [--at P] [--notes N]\n" ++
   "       horas sync [PEER...] | export | import FILE\n" ++
   "       horas login [ACCOUNT]\n" ++
+  "       horas slots [OPTION...] | publish [OPTION...]   (open slots for a call; see horas slots --help)\n" ++
   "WHEN: 2026-11-29 or 2026-11-29T19:00"
 
 def horas.args(+e: Env, xs: List<String>) -> IO(Unit):
@@ -1153,6 +1626,10 @@ def horas.args(+e: Env, xs: List<String>) -> IO(Unit):
       cmd.import(e, path)
     case "login" <> hint:
       cmd.login(e, hint)
+    case "slots" <> rest:
+      cmd.slots(e, rest)
+    case "publish" <> rest:
+      cmd.publish(e, rest)
     case _:
       IO.die(Unit, 2, usage())
 

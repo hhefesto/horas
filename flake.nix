@@ -1,6 +1,7 @@
 {
   # horas: a calendar in Bend, one copy per machine, joined
-  # over ssh and with Google Calendar. The program is Main.bend and
+  # over ssh and with Google Calendar; and the open slots it publishes for
+  # booking a call (Slots.bend, LAWS.bend, PROOF.bend). The program is Main.bend and
   # the files it imports; this flake only builds it and names the programs
   # it runs (ssh, curl, date, mv, mkdir, mktemp, chmod, sha256sum; and
   # xdg-open, from the desktop, to show Google's sign-in).
@@ -36,6 +37,12 @@
             cd w/horas
             bend --check-only Main.bend | tee check.log
             grep -q 'ALL PROOFS CHECK' check.log
+            # the open slots' laws (LAWS.bend), proven (PROOF.bend), and
+            # their tests (the checks minute by minute, the dates)
+            bend --check-only PROOF.bend | tee proof.log
+            grep -q 'ALL PROOFS CHECK' proof.log
+            bend tests/slots.bend -o slots-test
+            ./slots-test
             bend Main.bend -o $out/bin/horas
           '';
         in {
